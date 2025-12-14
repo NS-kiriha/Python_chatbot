@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>API Test</title>
+    <script>
+        async function testAPI() {
+            const query = document.getElementById('query').value || 'laptop';
+            const resultDiv = document.getElementById('result');
+            
+            try {
+                const response = await fetch('http://localhost:5201/api/search', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ query })
+                });
+                
+                const data = await response.json();
+                resultDiv.innerHTML = `<pre>${JSON.stringify(data, null, 2)}</pre>`;
+                console.log('Response:', data);
+            } catch (error) {
+                resultDiv.innerHTML = `Error: ${error.message}`;
+                console.error('Error:', error);
+            }
+        }
+    </script>
+</head>
+<body>
+    <h1>API Test Page</h1>
+    <input type="text" id="query" placeholder="Enter search term" value="laptop">
+    <button onclick="testAPI()">Test API</button>
+    <div id="result" style="margin-top: 20px; white-space: pre-wrap;"></div>
+</body>
+</html>

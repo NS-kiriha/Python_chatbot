@@ -1,0 +1,58 @@
+{
+  "manifest_version": 3,
+  "name": "E-commerce Product Finder",
+  "version": "1.0",
+  "description": "Scans e-commerce sites to find products matching your search with a floating chat interface",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "tabs",
+    "scripting",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "http://localhost:5201/*",
+    "<all_urls>"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "chat.html",
+        "chat.js",
+        "chat.css",
+        "popup.html",
+        "images/*"
+      ],
+      "matches": ["http://*/*", "https://*/*"],
+      "use_dynamic_url": false
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src http://localhost:5201 http://127.0.0.1:5201 'self' http://* https://*;"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "images/icon16.png",
+      "48": "images/icon48.png"
+    },
+    "default_title": "E-commerce Product Finder"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "css": ["chat.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "icons": {
+    "16": "images/icon16.png",
+    "48": "images/icon48.png"
+  }
+}

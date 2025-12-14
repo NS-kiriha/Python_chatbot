@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart Product Finder Chatbot</title>
+  <link rel="stylesheet" href="/static/chat.css">
+</head>
+<body>
+  <div class="chat-container">
+    <h1>💎 Product Finder Assistant</h1>
+
+    <div class="input-section">
+      <input type="text" id="query" placeholder="What are you looking for?" />
+      <input type="number" id="budget" placeholder="Budget (optional)" />
+      <button id="searchBtn">Search</button>
+    </div>
+
+    <div id="results">
+      <h2>Matching Products</h2>
+      <div id="productList"></div>
+
+      <h2>Recommended Combination (within budget)</h2>
+      <div id="recommendList"></div>
+      <div id="totalPrice"></div>
+    </div>
+  </div>
+
+  <script src="/static/chat.js"></script>
+</body>
+</html>

@@ -1,0 +1,669 @@
+import os
+import datetime
+from flask import Flask, request, jsonify, make_response, send_from_directory
+from flask_cors import CORS, cross_origin
+import logging
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+import string
+import requests
+from bs4 import BeautifulSoup
+import json
+import re
+from functools import wraps
+from dotenv import load_dotenv
+import threading
+from sqlalchemy import create_engine, text
+import pandas as pd
+
+# -----------------------------
+# Load environment variables
+# -----------------------------
+load_dotenv()
+
+# -----------------------------
+# Logging setup
+# -----------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# -----------------------------
+# Optional: SERP API key
+# -----------------------------
+SERPAPI_API_KEY = os.getenv('SERPAPI_API_KEY', None)
+
+# -----------------------------
+# Ensure NLTK resources
+# -----------------------------
+def ensure_nltk_resources():
+    resources = {
+        'punkt': 'tokenizers/punkt',
+        'stopwords': 'corpora/stopwords',
+        'wordnet': 'corpora/wordnet'
+    }
+    nltk_dir = os.path.join(os.path.expanduser('~'), 'nltk_data')
+    os.makedirs(nltk_dir, exist_ok=True)
+    nltk.data.path.append(nltk_dir)
+    for resource, path in resources.items():
+        try:
+            nltk.data.find(path)
+            logger.info(f"NLTK resource '{resource}' found.")
+        except LookupError:
+            logger.info(f"Downloading NLTK resource '{resource}'...")
+            nltk.download(resource, download_dir=nltk_dir)
+
+def start_nltk_download():
+    try:
+        ensure_nltk_resources()
+    except Exception as e:
+        logger.error(f"Error in NLTK download thread: {e}")
+
+nltk_thread = threading.Thread(target=start_nltk_download, daemon=True)
+nltk_thread.start()
+
+# -----------------------------
+# Flask app setup
+# -----------------------------
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(CURRENT_DIR, 'static')
+os.makedirs(STATIC_DIR, exist_ok=True)
+
+app = Flask(__name__, static_folder=STATIC_DIR, static_url_path='/static')
+cors = CORS(app, resources={r"/*": {"origins": "*"}})
+
+# -----------------------------
+# Database setup (SQL Server)
+# -----------------------------
+DB_SERVER = os.getenv('DB_SERVER', 'NISCHAL')
+DB_NAME = os.getenv('DB_NAME', 'Stupa_Jewelers1')
+
+connection_string = (
+    f"mssql+pyodbc://@{DB_SERVER}/{DB_NAME}"
+    "?driver=ODBC+Driver+17+for+SQL+Server;"
+    "Trusted_Connection=yes;"
+    "TrustServerCertificate=yes"
+)
+
+try:
+    engine = create_engine(connection_string)
+    logger.info('✅ Database engine created successfully.')
+except Exception as e:
+    logger.error(f'❌ Error creating DB engine: {e}')
+    engine = None
+
+# -----------------------------
+# CORS Middleware
+# -----------------------------
+@app.after_request
+def after_request(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Origin'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    if response.mimetype == 'text/css':
+        response.headers['Content-Type'] = 'text/css; charset=utf-8'
+    return response
+
+# -----------------------------
+# Knapsack Algorithm
+# -----------------------------
+def knapsack_recommendation(products, budget):
+    if not products or budget <= 0:
+        return []
+
+    budget_cents = int(round(budget * 100))
+    n = len(products)
+    prices = [int(round(p['price'] * 100)) for p in products]
+    values = [float(p.get('score', 1.0)) for p in products]
+
+    dp = [[0] * (budget_cents + 1) for _ in range(n + 1)]
+
+    for i in range(1, n + 1):
+        for w in range(budget_cents + 1):
+            if prices[i - 1] <= w:
+                dp[i][w] = max(values[i - 1] + dp[i - 1][w - prices[i - 1]], dp[i - 1][w])
+            else:
+                dp[i][w] = dp[i - 1][w]
+
+    res = []
+    w = budget_cents
+    for i in range(n, 0, -1):
+        if dp[i][w] != dp[i - 1][w]:
+            res.append(products[i - 1])
+            w -= prices[i - 1]
+    res.reverse()
+    return res
+
+# -----------------------------
+# Fetch products from SQL Server
+# -----------------------------
+def fetch_products_from_db(query_text, limit=50):
+    if engine is None:
+        logger.error('No DB engine available.')
+        return []
+
+    q = f"%{query_text}%"
+    sql = text("""
+        SELECT TOP (:limit) ProductItemId, ProductName, ProductCode, description, UnitPrice, Thumbnail
+        FROM ProductItem
+        WHERE ProductName LIKE :q OR description LIKE :q
+    """)
+
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(sql, conn, params={'limit': limit, 'q': q})
+        products = []
+        for _, row in df.iterrows():
+            price = float(row['UnitPrice']) if row['UnitPrice'] is not None else 0.0
+            products.append({
+                'id': int(row['ProductItemId']),
+                'name': row.get('ProductName') or '',
+                'code': row.get('ProductCode') or '',
+                'description': row.get('description') or '',
+                'price': price,
+                'image': row.get('Thumbnail') or ''
+            })
+        return products
+    except Exception as e:
+        logger.error(f'Error fetching products from DB: {e}')
+        return []
+
+# -----------------------------
+# API: Search + Knapsack
+# -----------------------------
+@app.route('/api/search', methods=['POST', 'OPTIONS', 'GET'])
+@cross_origin()
+def api_search():
+    if request.method == 'OPTIONS':
+        return make_response('', 200)
+    if request.method == 'GET':
+        return jsonify({'status': 'success', 'message': 'API running (search replacement).'})
+
+    try:
+        data = request.get_json() or {}
+        query = (data.get('query') or '').strip()
+        budget = data.get('budget')
+        budget = float(budget) if budget not in (None, '') else None
+
+        if not query:
+            return jsonify({'status': 'error', 'message': 'Query is required', 'products': []}), 400
+
+        products = fetch_products_from_db(query, limit=100)
+        if not products:
+            return jsonify({'status': 'success', 'products': [], 'recommendations': []})
+
+        # Naive scoring
+        query_tokens = set(re.findall(r"\w+", query.lower()))
+        for p in products:
+            text = (p['name'] + ' ' + p['description']).lower()
+            tokens = set(re.findall(r"\w+", text))
+            common = tokens.intersection(query_tokens)
+            p['score'] = float(len(common)) + 0.1
+            p['score'] += max(0, (1.0 / (1 + p['price'])))
+
+        recommendations = []
+        total_price = 0.0
+        if budget:
+            recommendations = knapsack_recommendation(products, budget)
+            total_price = sum([item['price'] for item in recommendations])
+
+        return jsonify({
+            'status': 'success',
+            'products': products,
+            'recommendations': recommendations,
+            'total_price': total_price
+        })
+
+    except Exception as e:
+        logger.exception('Error in /api/search: %s', e)
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# -----------------------------
+# Root and Static
+# -----------------------------
+@app.route('/')
+def index():
+    return 'Product finder API (knapsack-enabled) is running.'
+
+@app.route('/chat')
+def chat_interface():
+    try:
+        return send_from_directory(STATIC_DIR, 'chat.html')
+    except Exception as e:
+        return str(e), 404
+
+# -----------------------------
+# Entry Point
+# -----------------------------
+if __name__ == '__main__':
+    print(r"C:\Users\Nischal Shakya\Desktop\Chatbot_Extension\backend\static")
+    try:
+        app.run(host='0.0.0.0', port=int(os.getenv('PORT', '5201')), debug=True)
+    except Exception as e:
+        logger.exception('App failed to start: %s', e)
+
+# import os
+# import datetime
+# from flask import Flask, request, jsonify, make_response, send_from_directory
+# from flask_cors import CORS, cross_origin
+# import logging
+# import nltk
+# from nltk.tokenize import word_tokenize
+# from nltk.corpus import stopwords
+# from nltk.stem import WordNetLemmatizer
+# import string
+# import requests
+# from bs4 import BeautifulSoup
+# import json
+# import re
+# from functools import wraps
+# from dotenv import load_dotenv
+
+# # Load environment variables from .env file
+# load_dotenv()
+
+# # Configure logging
+# logging.basicConfig(level=logging.INFO)
+# logger = logging.getLogger(__name__)
+
+# # Get SERP API key from environment variables
+# SERPAPI_API_KEY = os.getenv('SERPAPI_API_KEY', 'your_default_api_key_here')  
+# if not SERPAPI_API_KEY:
+#     logger.warning('SERPAPI_API_KEY not found in environment variables. Using default test data.')
+#     SERPAPI_API_KEY = None
+
+# def ensure_nltk_resources():
+#     """Ensure all required NLTK resources are available."""
+#     resources = {
+#         'punkt': 'tokenizers/punkt',
+#         'stopwords': 'corpora/stopwords',
+#         'wordnet': 'corpora/wordnet'
+#     }
+    
+#     nltk_dir = os.path.join(os.path.expanduser('~'), 'nltk_data')
+#     if not os.path.exists(nltk_dir):
+#         os.makedirs(nltk_dir, exist_ok=True)
+#     nltk.data.path.append(nltk_dir)
+    
+#     for resource, path in resources.items():
+#         try:
+#             nltk.data.find(path)
+#             logger.info(f"NLTK resource '{resource}' found.")
+#         except LookupError:
+#             logger.info(f"NLTK resource '{resource}' not found. Attempting download...")
+#             try:
+#                 nltk.download(resource, download_dir=nltk_dir)
+#                 logger.info(f"Successfully downloaded NLTK resource: {resource}")
+#             except Exception as e:
+#                 logger.error(f"Failed to download NLTK resource {resource}: {e}")
+#                 logger.warning(f"Some features might not work without {resource}")
+
+# import threading
+# def start_nltk_download():
+#     try:
+#         ensure_nltk_resources()
+#     except Exception as e:
+#         logger.error(f"Error in NLTK download thread: {e}")
+
+# nltk_thread = threading.Thread(target=start_nltk_download, daemon=True)
+# nltk_thread.start()
+
+# CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+# STATIC_DIR = os.path.join(CURRENT_DIR, 'static')
+
+# # Create static directory if it doesn't exist
+# os.makedirs(STATIC_DIR, exist_ok=True)
+
+# # Copy required files to static directory if they don't exist
+# def copy_to_static(filename):
+#     src = os.path.join(os.path.dirname(CURRENT_DIR), filename)
+#     dst = os.path.join(STATIC_DIR, filename)
+#     if os.path.exists(src) and not os.path.exists(dst):
+#         import shutil
+#         shutil.copy2(src, dst)
+#         logger.info(f"Copied {filename} to static directory")
+
+# # Ensure all required files are in static directory
+# for file in ['chat.html', 'chat.css', 'chat.js']:
+#     copy_to_static(file)
+
+# app = Flask(__name__, 
+#             static_folder=STATIC_DIR,
+#             static_url_path='/static')
+
+# # Configure CORS to allow all origins and handle preflight requests
+# cors = CORS(app, resources={
+#     r"/*": {
+#         "origins": "*",
+#         "methods": ["GET", "POST", "OPTIONS"],
+#         "allow_headers": ["Content-Type", "Authorization"]
+#     }
+# })
+
+# # Unified after_request handler: add CORS headers and adjust MIME for css
+# @app.after_request
+# def after_request(response):
+#     # Allow requests from the Chrome extension
+#     if request.headers.get('Origin', '').startswith('chrome-extension://'):
+#         response.headers['Access-Control-Allow-Origin'] = request.headers['Origin']
+#     else:
+#         response.headers['Access-Control-Allow-Origin'] = '*'
+    
+#     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Origin'
+#     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+#     response.headers['Access-Control-Allow-Credentials'] = 'true'
+    
+#     # Ensure static CSS responses have charset
+#     if response.mimetype == 'text/css':
+#         response.headers['Content-Type'] = 'text/css; charset=utf-8'
+#     return response
+
+# @app.route('/api/search', methods=['OPTIONS'])
+# @cross_origin(origins='*')
+# def search_options():
+#     response = make_response()
+#     response.headers.add('Access-Control-Allow-Origin', '*')
+#     response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization, Origin')
+#     response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+#     return response
+
+# # Initialize NLTK components safely
+# try:
+#     stop_words = set(stopwords.words('english'))
+# except LookupError:
+#     # NLTK stopwords not available; fall back to empty set and log a warning
+#     logger.warning("NLTK stopwords corpus not available. Continuing with empty stopword list.")
+#     stop_words = set()
+
+# lemmatizer = WordNetLemmatizer()
+
+# def preprocess_text(text):
+#     """Preprocess the input text for better matching."""
+#     # Convert to lowercase
+#     text = text.lower()
+    
+#     # Remove punctuation
+#     text = text.translate(str.maketrans('', '', string.punctuation))
+    
+#     # Tokenize
+#     tokens = word_tokenize(text)
+    
+#     # Remove stopwords and lemmatize
+#     tokens = [lemmatizer.lemmatize(token) for token in tokens if token not in stop_words]
+    
+#     return tokens
+
+# def extract_products_from_html(html_content, query_tokens):
+#     """Extract product information from HTML content."""
+#     soup = BeautifulSoup(html_content, 'html.parser')
+#     products = []
+    
+#     # Common product container selectors
+#     product_selectors = [
+#         # Amazon
+#         '.s-result-item[data-component-type="s-search-result"]',
+#         # eBay
+#         '.s-item',
+#         # Common class names
+#         '.product',
+#         '.item',
+#         '.card',
+#         '.product-item',
+#         # Common data attributes
+#         '[data-product]',
+#         '[data-item]'
+#     ]
+    
+#     for selector in product_selectors:
+#         for product_element in soup.select(selector):
+#             try:
+#                 if len(str(product_element)) < 100:
+#                     continue
+                
+#                 # Extract product information
+#                 title_element = product_element.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'a', 'span', 'div'], 
+#                                                   class_=re.compile(r'(?i)title|name|product'))
+#                 title = title_element.get_text(strip=True) if title_element else ''
+                
+#                 price_element = product_element.find(class_=re.compile(r'(?i)price|amount|cost'))
+#                 price = price_element.get_text(strip=True) if price_element else ''
+                
+#                 # Clean up price
+#                 price = re.sub(r'[^\d.,$€£¥]', '', price)
+                
+#                 # Find the closest link
+#                 link_element = product_element.find('a', href=True)
+#                 url = link_element['href'] if link_element else ''
+                
+#                 # Make URL absolute if it's relative
+#                 if url and not url.startswith(('http://', 'https://')):
+#                     url = f"https://{request.host}{url if url.startswith('/') else '/' + url}"
+                
+#                 # Calculate relevance score
+#                 if title:
+#                     title_tokens = set(preprocess_text(title))
+#                     common_tokens = title_tokens.intersection(query_tokens)
+#                     relevance = len(common_tokens) / len(query_tokens) if query_tokens else 0
+#                 else:
+#                     relevance = 0
+                
+#                 if title and (url or price):
+#                     products.append({
+#                         'title': title,
+#                         'price': price,
+#                         'url': url,
+#                         'relevance': relevance
+#                     })
+                    
+#             except Exception as e:
+#                 print(f"Error processing product element: {e}")
+#                 continue
+    
+#     # Sort by relevance and return top 10 results
+#     return sorted(products, key=lambda x: x['relevance'], reverse=True)[:10]
+
+# def search_google_shopping(query, num_results=5):
+#     """Search for products using SERP API Google Shopping."""
+#     try:
+#         params = {
+#             'api_key': SERPAPI_API_KEY,
+#             'engine': 'google_shopping',
+#             'q': query,
+#             'num': num_results,
+#             'hl': 'en',
+#             'gl': 'us'
+#         }
+        
+#         response = requests.get('https://serpapi.com/search', params=params)
+#         response.raise_for_status()
+#         data = response.json()
+        
+#         products = []
+#         if 'shopping_results' in data:
+#             for item in data['shopping_results']:
+#                 product = {
+#                     'title': item.get('title', ''),
+#                     'price': item.get('price', 'N/A'),
+#                     'url': item.get('link', ''),
+#                     'source': item.get('source', ''),
+#                     'image': item.get('thumbnail', ''),
+#                     'relevance': 1.0  # SERP API results are already relevant
+#                 }
+#                 products.append(product)
+        
+#         return products
+#     except Exception as e:
+#         print(f"Error searching Google Shopping: {str(e)}")
+#         return []
+
+# @app.route('/api/search', methods=['GET', 'POST', 'OPTIONS'])
+# @cross_origin(origins='*')
+# def search_products():
+#     """API endpoint to search for products."""
+#     logger.info('Received request to /api/search')
+#     logger.info('Request method: %s', request.method)
+#     logger.info('Request headers: %s', dict(request.headers))
+    
+#     # Handle GET request for testing
+#     if request.method == 'GET':
+#         logger.info('Handling GET request - sending test data')
+#         return jsonify({
+#             'status': 'success',
+#             'message': 'Backend is running!',
+#             'products': [
+#                 {'title': 'Test Product 1', 'price': '$99.99', 'url': 'https://example.com/1'},
+#                 {'title': 'Test Product 2', 'price': '$199.99', 'url': 'https://example.com/2'}
+#             ]
+#         })
+#     if request.method == 'OPTIONS':
+#         response = make_response()
+#         response.headers.add('Access-Control-Allow-Origin', '*')
+#         response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+#         response.headers.add('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+#         return response
+        
+#     try:
+#         logger.info('Parsing request body')
+#         try:
+#             data = request.get_json()
+#             logger.info('Request body: %s', data)
+#         except Exception as e:
+#             logger.error('Failed to parse JSON request body: %s', str(e))
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'Invalid JSON in request body',
+#                 'products': []
+#             }), 400
+            
+#         query = data.get('query', '').strip() if data else ''
+#         logger.info('Search query: %s', query)
+        
+#         if not query:
+#             logger.warning('Empty query received')
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'Query parameter is required',
+#                 'products': []
+#             }), 400
+            
+#         try:
+#             # Call the search function
+#             results = search_google_shopping(query, num_results=5)
+            
+#             # If no results or API key is not set, return test data
+#             if not results or not SERPAPI_API_KEY:
+#                 logger.info("Using test data for query: %s", query)
+#                 results = [
+#                     {
+#                         'title': f"Sample product for: {query}",
+#                         'price': '$99.99',
+#                         'url': 'https://example.com/product1',
+#                         'source': 'Test Store',
+#                         'image': 'https://via.placeholder.com/150',
+#                         'relevance': 1.0
+#                     },
+#                     {
+#                         'title': f"Another product for: {query}",
+#                         'price': '$149.99',
+#                         'url': 'https://example.com/product2',
+#                         'source': 'Test Store',
+#                         'image': 'https://via.placeholder.com/150',
+#                         'relevance': 0.9
+#                     }
+#                 ]
+            
+#             response = jsonify({
+#                 'status': 'success',
+#                 'products': results
+#             })
+#             return response
+            
+#         except requests.RequestException as e:
+#             logger.error("API request failed: %s", str(e))
+#             return jsonify({
+#                 'status': 'error',
+#                 'message': 'Failed to fetch product data. Please try again.',
+#                 'products': []
+#             }), 503
+        
+#     except Exception as e:
+#         logger.error("Unexpected error: %s", str(e))
+#         response = jsonify({
+#             'status': 'error',
+#             'message': 'An unexpected error occurred. Please try again later.',
+#             'products': []
+#         })
+#         response.headers.add('Access-Control-Allow-Origin', '*')
+#         return response, 500
+
+# @app.route('/')
+# def index():
+#     return "E-commerce Product Finder API is running!"
+
+# @app.route('/test', methods=['GET', 'POST'])
+# @cross_origin()
+# def test_endpoint():
+#     """Simple test endpoint to verify server is working."""
+#     logger.info('Test endpoint called - method: %s', request.method)
+#     try:
+#         if request.method == 'POST':
+#             data = request.get_json()
+#             return jsonify({
+#                 'status': 'success',
+#                 'message': 'POST request received',
+#                 'data': data or {},
+#                 'products': [
+#                     {
+#                         'title': 'Test Product',
+#                         'price': '$99.99',
+#                         'url': 'https://example.com/test',
+#                         'source': 'Test Store',
+#                         'image': 'https://via.placeholder.com/150'
+#                     }
+#                 ]
+#             })
+#         return jsonify({
+#             'status': 'success',
+#             'message': 'GET request received',
+#             'time': datetime.datetime.now().isoformat(),
+#             'products': [
+#                 {
+#                     'title': 'Test Product',
+#                     'price': '$99.99',
+#                     'url': 'https://example.com/test',
+#                     'source': 'Test Store',
+#                     'image': 'https://via.placeholder.com/150'
+#                 }
+#             ]
+#         })
+#     except Exception as e:
+#         logger.error('Error in test endpoint: %s', str(e))
+#         return jsonify({
+#             'status': 'error',
+#             'message': str(e),
+#             'products': []
+#         }), 500
+
+
+# @app.route('/chat')
+# def chat_interface():
+#     """Serve the chat interface HTML."""
+#     try:
+#         return send_from_directory(STATIC_DIR, 'chat.html')
+#     except Exception as e:
+#         return str(e), 404
+
+# @app.route('/static/chat.css')
+# def chat_css():
+#     """Serve the chat CSS."""
+#     try:
+#         return send_from_directory(STATIC_DIR, 'chat.css')
+#     except Exception as e:
+#         return str(e), 404
+
+# if __name__ == '__main__':
+#     print(f"Static folder path: {app.static_folder}")
+#     print(f"Files in static folder: {os.listdir(app.static_folder) if os.path.exists(app.static_folder) else 'Static folder not found'}")
+#     app.run(host='0.0.0.0', port=int(os.getenv('PORT', '5201')), debug=True)
